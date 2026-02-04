@@ -2,86 +2,88 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // ✅ CORS preflight (obligatoire sur iOS)
+    // ✅ CORS preflight
     if (request.method === "OPTIONS") {
       return cors(new Response(null, { status: 204 }));
     }
 
-    // ✅ HOME
+    // ✅ Health check (pour voir si KV est bien bind)
+    if (url.pathname === "/health") {
+      return cors(json({
+        ok: true,
+        hasKV: !!env.KEYS_DB,
+        now: Date.now()
+      }, 200));
+    }
+
+    // ✅ Home
     if (url.pathname === "/" && request.method === "GET") {
       return cors(new Response("Server online 😈", { status: 200 }));
     }
 
-    // ✅ VERIFY KEY -> TOKEN (2h)
+    // ✅ Verify
     if (url.pathname === "/verify" && request.method === "POST") {
       try {
+        if (!env.KEYS_DB) {
+          return cors(json({ ok:false, error:"no_kv_binding", hint:"Vérifie Bindings -> KV -> KEYS_DB" }, 500));
+        }
+
         const body = await request.json().catch(() => ({}));
         const key = String(body.key || "").trim();
+        if (!key) return cors(json({ ok:false, error:"missing_key" }, 400));
 
-        if (!key) return cors(json({ ok: false, error: "missing_key" }, 400));
-
-        // On stocke dans KV sous la forme: key:TEST-1234
         const raw = await env.KEYS_DB.get(`key:${key}`);
-        if (!raw) return cors(json({ ok: false, error: "invalid" }, 401));
+        if (!raw) return cors(json({ ok:false, error:"invalid" }, 401));
 
         let rec;
         try {
           rec = JSON.parse(raw);
-        } catch {
-          return cors(json({ ok: false, error: "bad_record" }, 500));
+        } catch (e) {
+          return cors(json({
+            ok:false,
+            error:"bad_json_in_kv",
+            hint:"La VALUE KV doit être un JSON valide, ex: {\"banned\":false,\"exp\":1893456000000}",
+            raw
+          }, 500));
         }
 
-        if (rec.banned) return cors(json({ ok: false, error: "banned" }, 403));
-        if (typeof rec.exp === "number" && Date.now() > rec.exp) {
-          return cors(json({ ok: false, error: "expired" }, 403));
-        }
+        if (rec.banned) return cors(json({ ok:false, error:"banned" }, 403));
+        if (typeof rec.exp === "number" && Date.now() > rec.exp) return cors(json({ ok:false, error:"expired" }, 403));
 
-        // Token 2h
         const token = crypto.randomUUID().replace(/-/g, "");
-        await env.KEYS_DB.put(`token:${token}`, "1", { expirationTtl: 2 * 60 * 60 });
+        await env.KEYS_DB.put(`token:${token}`, "1", { expirationTtl: 2 * 60 * 60 }); // 2h
 
-        return cors(json({ ok: true, token }, 200));
+        return cors(json({ ok:true, token }, 200));
       } catch (e) {
-        return cors(json({ ok: false, error: "server_error" }, 500));
+        return cors(json({ ok:false, error:"server_error", detail: String(e?.message || e) }, 500));
       }
     }
 
-    // ✅ MENU JSON (protégé par token)
+    // ✅ Menu
     if (url.pathname === "/menu" && request.method === "GET") {
-      const auth = request.headers.get("Authorization") || "";
-      const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+      try {
+        if (!env.KEYS_DB) return cors(json({ ok:false, error:"no_kv_binding" }, 500));
 
-      if (!token) return cors(json({ ok: false, error: "missing_token" }, 401));
+        const auth = request.headers.get("Authorization") || "";
+        const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+        if (!token) return cors(json({ ok:false, error:"missing_token" }, 401));
 
-      const ok = await env.KEYS_DB.get(`token:${token}`);
-      if (!ok) return cors(json({ ok: false, error: "bad_token" }, 401));
+        const ok = await env.KEYS_DB.get(`token:${token}`);
+        if (!ok) return cors(json({ ok:false, error:"bad_token" }, 401));
 
-      // ⚙️ Ton menu (tu peux modifier ici)
-      return cors(
-        json(
-          {
-            ok: true,
-            title: "😈 CHEAT MENU",
-            theme: "blue",
-            items: [
-              { id: "snow", label: "Neige ❄️", type: "toggle", value: true },
-              { id: "glow", label: "Glow UI ✨", type: "toggle", value: true },
-              {
-                id: "color",
-                label: "Couleur 🎨",
-                type: "select",
-                options: ["Bleu", "Rouge", "Violet"],
-                value: "Bleu"
-              },
-              { id: "alpha", label: "Opacité", type: "range", min: 0.2, max: 1, step: 0.05, value: 0.92 }
-            ]
-          },
-          200
-        )
-      );
+        return cors(json({
+          ok: true,
+          title: "😈 CHEAT MENU",
+          items: [
+            { id:"snow", label:"Neige ❄️", type:"toggle", value:true }
+          ]
+        }, 200));
+      } catch (e) {
+        return cors(json({ ok:false, error:"server_error", detail: String(e?.message || e) }, 500));
+      }
     }
 
-    return cors(json({ ok: false, error: "not_found" }, 404));
+    return cors(json({ ok:false, error:"not_found", path:url.pathname }, 404));
   }
 };
 
