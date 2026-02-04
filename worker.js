@@ -1,44 +1,69 @@
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
+  async fetch(req, env) {
+    const url = new URL(req.url);
 
-    if (request.method === "OPTIONS") return cors(new Response("", { status: 204 }));
-
-    if (url.pathname === "/" && request.method === "GET") {
-      return cors(new Response("Server online 😈", { status: 200 }));
+    // Ping serveur
+    if (url.pathname === "/") {
+      return new Response("Server online 😈");
     }
 
-    if (url.pathname === "/verify" && request.method === "POST") {
-      const body = await request.json().catch(() => ({}));
-      const key = (body.key || "").trim();
+    // Vérification clé
+    if (url.pathname === "/verify" && req.method === "POST") {
+      try {
+        const body = await req.json();
+        const key = String(body.key || "").trim();
 
-      if (!key) return cors(json({ ok:false, error:"missing key" }));
+        if (!key) {
+          return json({ ok: false, error: "missing key" });
+        }
 
-      const recRaw = await env.KEYS_DB.get("key:" + key);
-      if (!recRaw) return cors(json({ ok:false, error:"invalid" }));
+        // 👉 KV lookup
+        const data = await env.KEYS_DB.get(`key:${key}`);
 
-      const rec = JSON.parse(recRaw);
+        if (!data) {
+          return json({ ok: false, error: "not found" });
+        }
 
-      if (rec.banned) return cors(json({ ok:false, error:"banned" }));
-      if (Date.now() > rec.exp) return cors(json({ ok:false, error:"expired" }));
+        const parsed = JSON.parse(data);
 
-      return cors(json({ ok:true }));
+        if (parsed.banned) {
+          return json({ ok: false, error: "banned" });
+        }
+
+        if (Date.now() > parsed.exp) {
+          return json({ ok: false, error: "expired" });
+        }
+
+        // Token simple
+        const token = btoa(key + ":" + Date.now());
+
+        return json({
+          ok: true,
+          token
+        });
+
+      } catch (e) {
+        return json({ ok: false, error: "server error" });
+      }
     }
 
-    return cors(json({ ok:false, error:"not found" }));
+    // Menu fake pour test
+    if (url.pathname === "/menu") {
+      return new Response(`
+        <html>
+        <body style="background:black;color:white;font-size:40px;">
+        ✅ MENU LOADED 😈
+        </body>
+        </html>
+      `, { headers: { "content-type": "text/html" } });
+    }
+
+    return new Response("404", { status: 404 });
   }
 };
 
 function json(obj) {
   return new Response(JSON.stringify(obj), {
-    headers: { "Content-Type": "application/json" }
+    headers: { "content-type": "application/json" }
   });
-}
-
-function cors(res) {
-  const h = new Headers(res.headers);
-  h.set("Access-Control-Allow-Origin", "*");
-  h.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  h.set("Access-Control-Allow-Headers", "Content-Type");
-  return new Response(res.body, { status: res.status, headers: h });
 }
