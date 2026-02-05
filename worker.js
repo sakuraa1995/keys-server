@@ -4,38 +4,8 @@ export default {
     const path = url.pathname;
     const now = Date.now();
 
-    // ---------- helpers ----------
-    const json = (obj, status = 200, extraHeaders = {}) =>
-      new Response(JSON.stringify(obj), {
-        status,
-        headers: {
-          "content-type": "application/json; charset=utf-8",
-          "cache-control": "no-store",
-          ...extraHeaders,
-        },
-      });
-
-    const html = (str, status = 200, extraHeaders = {}) =>
-      new Response(str, {
-        status,
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "no-store",
-          ...extraHeaders,
-        },
-      });
-
-    const text = (str, status = 200, extraHeaders = {}) =>
-      new Response(str, {
-        status,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          "cache-control": "no-store",
-          ...extraHeaders,
-        },
-      });
-
-    const cors = (res) => {
+    // -------- helpers --------
+    const withCors = (res) => {
       const h = new Headers(res.headers);
       h.set("Access-Control-Allow-Origin", "*");
       h.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -44,171 +14,214 @@ export default {
       return new Response(res.body, { status: res.status, headers: h });
     };
 
-    const safeJson = async (req) => {
-      try {
-        return await req.json();
-      } catch {
-        return null;
-      }
-    };
+    const json = (obj, status = 200) =>
+      withCors(
+        new Response(JSON.stringify(obj), {
+          status,
+          headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+        })
+      );
 
-    const requireKV = () => {
-      if (!env.KEYS_DB) throw new Error("KV binding manquant: KEYS_DB");
-    };
+    const html = (str, status = 200) =>
+      withCors(
+        new Response(str, {
+          status,
+          headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+        })
+      );
 
-    const requireAdminSecret = () => {
-      if (!env.ADMIN_SECRET) throw new Error("Variable manquante: ADMIN_SECRET");
-    };
+    const kvKey = (k) => `KEY:${k}`;
 
-    const isAuthed = (secret) => String(secret || "") === String(env.ADMIN_SECRET || "");
-
-    const kvKey = (key) => `KEY:${key}`;
-
-    const randomKey = () => {
-      const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sans 0/O/I/1
-      const bytes = new Uint8Array(16);
-      crypto.getRandomValues(bytes);
+    const randKey = () => {
+      const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+      const b = new Uint8Array(16);
+      crypto.getRandomValues(b);
       let s = "";
-      for (let i = 0; i < bytes.length; i++) s += alphabet[bytes[i] % alphabet.length];
+      for (let i = 0; i < b.length; i++) s += alphabet[b[i] % alphabet.length];
       return `SP-${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}`;
     };
 
-    const discord = async (content) => {
-      if (!env.DISCORD_WEBHOOK) return;
-      try {
-        await fetch(env.DISCORD_WEBHOOK, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ content }),
-        });
-      } catch {}
+    const msToClock = (ms) => {
+      if (ms == null) return "∞";
+      ms = Math.max(0, Math.floor(ms));
+      const s = Math.floor(ms / 1000);
+      const d = Math.floor(s / 86400);
+      const h = Math.floor((s % 86400) / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      const pad = (n) => String(n).padStart(2, "0");
+      if (d > 0) return `${d}d ${pad(h)}:${pad(m)}:${pad(sec)}`;
+      return `${pad(h)}:${pad(m)}:${pad(sec)}`;
     };
 
-    // ---------- preflight ----------
-    if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
+    const addLog = (rec, event, did, extra = {}) => {
+      const item = { t: now, event, did: did || null, ...extra };
+      rec.logs = Array.isArray(rec.logs) ? rec.logs : [];
+      rec.logs.push(item);
+      if (rec.logs.length > 10) rec.logs = rec.logs.slice(-10);
+    };
 
-    // ---------- health ----------
+    const isExpired = (rec) => typeof rec.exp === "number" && now >= rec.exp;
+
+    const getSecret = async () => {
+      if (request.method === "GET") {
+        return request.headers.get("x-admin-secret") || url.searchParams.get("secret") || "";
+      }
+      const h = request.headers.get("x-admin-secret");
+      if (h) return h;
+      try {
+        const body = await request.json();
+        return body?.secret || "";
+      } catch {
+        return "";
+      }
+    };
+
+    // -------- preflight --------
+    if (request.method === "OPTIONS") return withCors(new Response("", { status: 204 }));
+
+    // -------- health --------
     if (path === "/" || path === "/health") {
-      return cors(json({ ok: true, hasKV: !!env.KEYS_DB, now }, 200));
+      return json({ ok: true, online: true, now, hasKV: !!env.KEYS_DB, hasSecret: !!env.ADMIN_SECRET });
     }
 
-    // =========================================================
-    // ✅ PUBLIC API: check key (used by Stay)
-    // GET /api/check?key=SP-XXXX-XXXX-XXXX&did=DEVICE_ID
-    // ✅ 1 clé = 1 appareil (lock)
-    // =========================================================
-    if (path === "/api/check" && request.method === "GET") {
-      requireKV();
-      const key = (url.searchParams.get("key") || "").trim();
-      const did = (url.searchParams.get("did") || "").trim(); // <- device id venant du script Stay
+    // -------- admin panel --------
+    if (path === "/admin" && request.method === "GET") {
+      return html(ADMIN_HTML);
+    }
 
-      if (!key) return cors(json({ ok: false, reason: "missing_key" }, 400));
-      if (!did) return cors(json({ ok: false, reason: "missing_device" }, 400));
+    // =====================================================
+    // ✅ PUBLIC CHECK (Stay)
+    // GET /api/check?key=...&did=...
+    // =====================================================
+    if (path === "/api/check" && request.method === "GET") {
+      if (!env.KEYS_DB) return json({ ok: false, reason: "kv_missing" }, 500);
+
+      const key = (url.searchParams.get("key") || "").trim();
+      const did = (url.searchParams.get("did") || "").trim();
+
+      if (!key) return json({ ok: false, reason: "missing_key" }, 400);
+      if (!did) return json({ ok: false, reason: "missing_device" }, 400);
 
       const raw = await env.KEYS_DB.get(kvKey(key));
-      if (!raw) return cors(json({ ok: false, reason: "not_found" }, 404));
+      if (!raw) return json({ ok: false, reason: "not_found" }, 404);
 
       let rec;
       try {
         rec = JSON.parse(raw);
       } catch {
-        return cors(json({ ok: false, reason: "bad_record" }, 500));
+        return json({ ok: false, reason: "bad_record" }, 500);
       }
 
-      // sécurité si vieux records
-      if (typeof rec !== "object" || rec == null) rec = {};
-      if (typeof rec.banned !== "boolean") rec.banned = !!rec.banned;
-      if (typeof rec.uses !== "number") rec.uses = Number(rec.uses || 0) || 0;
+      rec.created = typeof rec.created === "number" ? rec.created : now;
+      rec.banned = !!rec.banned;
+      rec.uses = Number(rec.uses || 0) || 0;
+      rec.note = typeof rec.note === "string" ? rec.note : "";
+      rec.did = rec.did || null;
+      rec.lockedAt = typeof rec.lockedAt === "number" ? rec.lockedAt : null;
 
-      if (rec.banned) return cors(json({ ok: false, reason: "banned" }, 403));
-      if (typeof rec.exp === "number" && now >= rec.exp) return cors(json({ ok: false, reason: "expired" }, 403));
+      if (rec.banned) {
+        addLog(rec, "blocked_banned", did);
+        await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
+        return json({ ok: false, reason: "banned" }, 403);
+      }
 
-      // ✅ DEVICE LOCK (1 appareil max)
+      if (isExpired(rec)) {
+        addLog(rec, "blocked_expired", did);
+        await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
+        return json({ ok: false, reason: "expired", exp: rec.exp }, 403);
+      }
+
+      // 🔒 1 DEVICE LOCK
       if (!rec.did) {
-        // 1ère utilisation => on lock
         rec.did = did;
-        rec.lockedAt = rec.lockedAt || now;
+        rec.lockedAt = now;
+        addLog(rec, "first_lock", did);
       } else if (String(rec.did) !== String(did)) {
-        // déjà lock sur un autre appareil
-        return cors(
-          json(
-            {
-              ok: false,
-              reason: "device_mismatch",
-              lockedAt: rec.lockedAt || null,
-            },
-            403
-          )
-        );
+        // 🚨 share attempt
+        addLog(rec, "share_attempt", did, { lockedDid: rec.did });
+        await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
+        return json({ ok: false, reason: "device_mismatch", lockedAt: rec.lockedAt || null }, 403);
       }
 
-      // touches / uses (seulement si OK)
-      rec.uses = (rec.uses || 0) + 1;
+      rec.uses += 1;
+      addLog(rec, "login", did);
+
       await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
 
-      return cors(
-        json(
-          {
-            ok: true,
-            key,
-            exp: rec.exp || null,
-            remainingMs: rec.exp ? Math.max(0, rec.exp - now) : null,
-            note: rec.note || "",
-            uses: rec.uses || 0,
-            did: rec.did || null, // (pas obligatoire côté client, mais utile)
-          },
-          200
-        )
-      );
+      return json({
+        ok: true,
+        key,
+        exp: rec.exp || null,
+        remainingMs: rec.exp ? Math.max(0, rec.exp - now) : null,
+        uses: rec.uses,
+        did: rec.did,
+      });
     }
 
-    // =========================================================
-    // ✅ ADMIN UI
-    // GET /admin
-    // (INCHANGÉ)
-    // =========================================================
-    if (path === "/admin" && request.method === "GET") {
-      requireAdminSecret();
-      return html(ADMIN_HTML);
-    }
-
-    // =========================================================
-    // ✅ ADMIN API (POST JSON) - requires secret
-    // (INCHANGÉ sauf: on stocke did/lockedAt à null à la création)
-    // =========================================================
+    // =====================================================
+    // ✅ ADMIN API (secret required)
+    // =====================================================
     if (path.startsWith("/api/admin/")) {
-      requireKV();
-      requireAdminSecret();
+      if (!env.KEYS_DB) return json({ ok: false, reason: "kv_missing" }, 500);
+      if (!env.ADMIN_SECRET) return json({ ok: false, reason: "admin_secret_missing" }, 500);
 
-      const body = await safeJson(request);
-      const secret = body?.secret || request.headers.get("x-admin-secret");
+      const secret = await getSecret();
+      if (String(secret) !== String(env.ADMIN_SECRET)) return json({ ok: false, reason: "unauthorized" }, 401);
 
-      if (!isAuthed(secret)) return cors(json({ ok: false, error: "unauthorized" }, 401));
+      // POST /api/admin/create  {days,count,note}
+      if (path === "/api/admin/create" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const days = Math.max(1, Math.min(3650, Number(body.days || 30)));
+        const count = Math.max(1, Math.min(50, Number(body.count || 1)));
+        const note = String(body.note || "").slice(0, 120);
 
-      // LIST keys
+        const created = [];
+        for (let i = 0; i < count; i++) {
+          const key = randKey();
+          const rec = {
+            created: now,
+            exp: now + days * 86400000,
+            banned: false,
+            uses: 0,
+            note,
+            did: null,
+            lockedAt: null,
+            logs: [],
+          };
+          addLog(rec, "created", null);
+          await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
+          created.push({ key, exp: rec.exp, note });
+        }
+        return json({ ok: true, created, now });
+      }
+
+      // POST /api/admin/list {limit}
       if (path === "/api/admin/list" && request.method === "POST") {
-        const limit = Math.min(800, Math.max(1, Number(body?.limit ?? 300)));
-        const res = await env.KEYS_DB.list({ prefix: "KEY:", limit: 1000 });
+        const body = await request.json().catch(() => ({}));
+        const limit = Math.max(1, Math.min(800, Number(body.limit || 300)));
 
+        const list = await env.KEYS_DB.list({ prefix: "KEY:", limit: 1000 });
         const items = [];
-        for (const k of res.keys) {
+
+        for (const k of list.keys) {
           const raw = await env.KEYS_DB.get(k.name);
           if (!raw) continue;
           try {
             const d = JSON.parse(raw);
             items.push({
               key: k.name.replace(/^KEY:/, ""),
-              banned: !!d.banned,
-              exp: typeof d.exp === "number" ? d.exp : null,
               created: typeof d.created === "number" ? d.created : null,
-              note: d.note || "",
-              uses: d.uses || 0,
-              // champs lock (ne change pas ton UI)
+              exp: typeof d.exp === "number" ? d.exp : null,
+              banned: !!d.banned,
+              uses: Number(d.uses || 0) || 0,
+              note: typeof d.note === "string" ? d.note : "",
               did: d.did || null,
               lockedAt: typeof d.lockedAt === "number" ? d.lockedAt : null,
+              logs: Array.isArray(d.logs) ? d.logs : [],
             });
-            if (items.length >= limit) break;
           } catch {}
+          if (items.length >= limit) break;
         }
 
         // stats
@@ -217,92 +230,76 @@ export default {
           active: items.filter((x) => !x.banned && (!x.exp || now < x.exp)).length,
           expired: items.filter((x) => x.exp && now >= x.exp).length,
           banned: items.filter((x) => x.banned).length,
+          linked: items.filter((x) => !!x.did).length,
         };
 
         // newest first
         items.sort((a, b) => (b.created || 0) - (a.created || 0));
 
-        return cors(json({ ok: true, items, stats, now }, 200));
+        return json({ ok: true, items, stats, now });
       }
 
-      // CREATE keys (bulk)
-      if (path === "/api/admin/create" && request.method === "POST") {
-        const days = Math.max(1, Math.min(3650, Number(body?.days ?? 30)));
-        const count = Math.max(1, Math.min(100, Number(body?.count ?? 1)));
-        const note = String(body?.note ?? "").slice(0, 120);
-
-        const created = [];
-        for (let i = 0; i < count; i++) {
-          const key = randomKey();
-          const exp = now + days * 86400000;
-          // ✅ ajout did/lockedAt à null (compat)
-          const rec = { banned: false, exp, created: now, note, uses: 0, did: null, lockedAt: null };
-          await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
-          created.push({ key, exp, note });
-        }
-
-        ctx.waitUntil(discord(`🟣 SP-SPOOF | ${count} clé(s) créée(s) (${days}j) ✅`));
-        return cors(json({ ok: true, created, now }, 200));
-      }
-
-      // BAN / UNBAN
+      // POST /api/admin/ban {key,banned}
       if (path === "/api/admin/ban" && request.method === "POST") {
-        const key = String(body?.key || "").trim();
-        const banned = !!body?.banned;
-        if (!key) return cors(json({ ok: false, error: "missing_key" }, 400));
+        const body = await request.json().catch(() => ({}));
+        const key = String(body.key || "").trim();
+        const banned = !!body.banned;
+        if (!key) return json({ ok: false, reason: "missing_key" }, 400);
 
         const raw = await env.KEYS_DB.get(kvKey(key));
-        if (!raw) return cors(json({ ok: false, error: "not_found" }, 404));
+        if (!raw) return json({ ok: false, reason: "not_found" }, 404);
 
         const rec = JSON.parse(raw);
         rec.banned = banned;
+        addLog(rec, banned ? "banned" : "unbanned", null);
         await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
-
-        ctx.waitUntil(discord(`${banned ? "⛔️" : "✅"} SP-SPOOF | ${banned ? "Ban" : "Unban"}: \`${key}\``));
-        return cors(json({ ok: true, banned }, 200));
+        return json({ ok: true, key, banned });
       }
 
-      // DELETE
+      // POST /api/admin/delete {key}
       if (path === "/api/admin/delete" && request.method === "POST") {
-        const key = String(body?.key || "").trim();
-        if (!key) return cors(json({ ok: false, error: "missing_key" }, 400));
+        const body = await request.json().catch(() => ({}));
+        const key = String(body.key || "").trim();
+        if (!key) return json({ ok: false, reason: "missing_key" }, 400);
 
         await env.KEYS_DB.delete(kvKey(key));
-        ctx.waitUntil(discord(`🗑️ SP-SPOOF | Clé supprimée: \`${key}\``));
-        return cors(json({ ok: true }, 200));
+        return json({ ok: true, key, deleted: true });
       }
 
-      // EXPORT
-      if (path === "/api/admin/export" && request.method === "POST") {
-        const res = await env.KEYS_DB.list({ prefix: "KEY:", limit: 1000 });
-        const out = [];
-        for (const k of res.keys) {
-          const raw = await env.KEYS_DB.get(k.name);
-          if (!raw) continue;
-          try {
-            out.push({ key: k.name.replace(/^KEY:/, ""), data: JSON.parse(raw) });
-          } catch {}
-        }
-        return cors(json({ ok: true, export: out, now }, 200));
+      // POST /api/admin/reset {key}
+      if (path === "/api/admin/reset" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const key = String(body.key || "").trim();
+        if (!key) return json({ ok: false, reason: "missing_key" }, 400);
+
+        const raw = await env.KEYS_DB.get(kvKey(key));
+        if (!raw) return json({ ok: false, reason: "not_found" }, 404);
+
+        const rec = JSON.parse(raw);
+        rec.did = null;
+        rec.lockedAt = null;
+        addLog(rec, "reset_device", null);
+        await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
+
+        return json({ ok: true, key, reset: true });
       }
 
-      return cors(json({ ok: false, error: "not_found" }, 404));
+      return json({ ok: false, reason: "unknown_admin_route" }, 404);
     }
 
-    return text("Not found", 404);
+    return json({ ok: false, reason: "not_found" }, 404);
   },
 };
 
 // =========================
-// ADMIN PANEL (RESPONSIVE)
-// (INCHANGÉ)
+// ✅ ADMIN PANEL (FULL UI)
 // =========================
 const ADMIN_HTML = `<!doctype html>
 <html lang="fr">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>ADMIN SP-SPOOF</title>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>SP-SPOOF ADMIN</title>
 <style>
 :root{
   --bg:#060912;
@@ -317,122 +314,122 @@ const ADMIN_HTML = `<!doctype html>
 *{box-sizing:border-box}
 body{
   margin:0; min-height:100vh; overflow-x:hidden;
-  background: radial-gradient(1200px 700px at 20% 0%, #0a1c55 0%, transparent 55%),
-              radial-gradient(900px 600px at 80% 10%, #3b0764 0%, transparent 55%),
-              var(--bg);
+  background:
+    radial-gradient(1200px 700px at 20% 0%, #0a1c55 0%, transparent 55%),
+    radial-gradient(900px 600px at 80% 10%, #3b0764 0%, transparent 55%),
+    var(--bg);
   color:var(--txt);
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
 }
-.wrap{max-width:980px;margin:0 auto;padding:18px}
+.wrap{max-width:1100px;margin:0 auto;padding:16px}
 .card{
   position:relative;
   border:1px solid var(--stroke);
-  background:linear-gradient(180deg, rgba(12,18,40,.85), rgba(7,10,20,.55));
+  background:linear-gradient(180deg, rgba(12,18,40,.88), rgba(7,10,20,.55));
   border-radius:18px;
   box-shadow:var(--shadow);
-  padding:16px;
+  padding:14px;
   overflow:hidden;
 }
-h1{margin:0 0 6px;font-size:20px;letter-spacing:.6px}
-.sub{color:var(--muted);font-size:13px;margin-bottom:14px}
+h1{margin:0 0 6px;font-size:20px;letter-spacing:.8px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:10px}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 input, button{
   border-radius:14px;
   border:1px solid var(--stroke);
-  background:rgba(6,10,20,.7);
+  background:rgba(6,10,20,.72);
   color:var(--txt);
   padding:12px 12px;
   outline:none;
 }
 input::placeholder{color:#90a4ff66}
-.grow{flex:1}
-.w120{width:120px}
 .btn{
-  background:linear-gradient(180deg, rgba(14,165,233,.25), rgba(14,165,233,.08));
-  border:1px solid rgba(14,165,233,.55);
-  cursor:pointer;
-  font-weight:800;
-}
-.btn2{
-  background:linear-gradient(180deg, rgba(59,130,246,.35), rgba(59,130,246,.10));
-  border:1px solid rgba(59,130,246,.55);
-  cursor:pointer;
-  font-weight:800;
-}
-.btnBad{
-  background:linear-gradient(180deg, rgba(244,63,94,.25), rgba(244,63,94,.08));
+  background:linear-gradient(180deg, rgba(244,63,94,.22), rgba(244,63,94,.06));
   border:1px solid rgba(244,63,94,.55);
   cursor:pointer;
   font-weight:900;
-  padding:10px 12px;
+}
+.btn2{
+  background:linear-gradient(180deg, rgba(59,130,246,.32), rgba(59,130,246,.10));
+  border:1px solid rgba(59,130,246,.55);
+  cursor:pointer;
+  font-weight:900;
 }
 .btnTiny{
-  padding:8px 10px;
-  border-radius:12px;
-  font-size:13px;
-  cursor:pointer;
-  border:1px solid var(--stroke);
-  background:rgba(10,18,40,.65);
+  padding:8px 10px;border-radius:12px;font-size:13px;cursor:pointer;
+  border:1px solid rgba(255,255,255,.14);
+  background:rgba(10,18,40,.55);
 }
+.btnBad{
+  padding:8px 10px;border-radius:12px;font-size:13px;cursor:pointer;
+  border:1px solid rgba(244,63,94,.55);
+  background:rgba(244,63,94,.10);
+  font-weight:900;
+}
+.grow{flex:1}
+.w140{width:140px}
 .pill{
   display:inline-flex;align-items:center;gap:6px;
-  padding:7px 10px;border-radius:999px;border:1px solid var(--stroke);
-  background:rgba(10,18,40,.55);font-size:13px;color:var(--muted)
+  padding:7px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.10);
+  background:rgba(10,18,40,.45);font-size:13px;color:var(--muted)
 }
 .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
-.hr{height:1px;background:rgba(255,255,255,.06);margin:14px 0}
+.hr{height:1px;background:rgba(255,255,255,.06);margin:12px 0}
 table{width:100%;border-collapse:separate;border-spacing:0 10px}
 th{font-size:12px;color:var(--muted);text-align:left;padding:0 10px}
-td{padding:12px 10px;background:rgba(10,18,40,.55);border:1px solid rgba(28,43,85,.75)}
+td{padding:12px 10px;background:rgba(10,18,40,.52);border:1px solid rgba(28,43,85,.75);vertical-align:top}
 td:first-child{border-radius:14px 0 0 14px}
 td:last-child{border-radius:0 14px 14px 0}
 .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace}
-.right{text-align:right}
 .small{font-size:12px;color:var(--muted)}
+.right{text-align:right}
 .toast{
   position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
   background:rgba(0,0,0,.65);border:1px solid rgba(255,255,255,.12);
   padding:10px 14px;border-radius:14px;backdrop-filter: blur(10px);
-  display:none;z-index:3;
+  display:none;z-index:9999;
 }
-/* ❄️ snow */
+.panel{
+  display:grid;
+  grid-template-columns: 1.4fr .9fr;
+  gap:12px;
+}
+.box{
+  border:1px solid rgba(255,255,255,.10);
+  background:rgba(10,18,40,.42);
+  border-radius:16px;
+  padding:12px;
+}
+.logs{
+  max-height:360px;
+  overflow:auto;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size:12px;
+}
+.logItem{padding:8px 8px;border-bottom:1px solid rgba(255,255,255,.06)}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.14);margin-right:6px}
+.tagShare{border-color:rgba(244,63,94,.6);color:var(--bad)}
+.tagLogin{border-color:rgba(52,211,153,.6);color:var(--ok)}
+.tagInfo{border-color:rgba(59,130,246,.6);color:#9cc2ff}
 .snow{position:fixed;inset:0;pointer-events:none;z-index:2;opacity:.9}
 
-/* =========================
-   📱 Mobile Responsive
-   ========================= */
-input, button { font-size: 16px; } /* évite zoom iOS */
+input, button { font-size: 16px; } /* anti zoom iOS */
 
-@media (max-width: 520px) {
-  .wrap { padding: 12px; }
-  .card { padding: 12px; border-radius: 16px; }
-  h1 { font-size: 18px; }
-  .sub { font-size: 12px; }
-
-  .row { gap: 8px; }
-  .w120 { width: 100%; }
-  .grow { flex: 1 1 100%; }
-  .pill { width: 100%; justify-content: space-between; }
-
-  /* Table -> Cards */
-  table, thead, tbody, th, tr { display: block; width: 100%; }
-  thead { display: none; }
-  tr { margin-bottom: 10px; }
-  td {
-    display: block;
-    width: 100%;
-    border-radius: 14px !important;
-    margin-top: 8px;
-  }
+@media (max-width: 900px){
+  .panel{grid-template-columns:1fr}
+}
+@media (max-width: 520px){
+  .wrap{padding:12px}
+  table, thead, tbody, th, tr{display:block;width:100%}
+  thead{display:none}
+  tr{margin-bottom:10px}
+  td{display:block;width:100%;border-radius:14px !important;margin-top:8px}
   td[data-label]::before{
     content: attr(data-label);
-    display:block;
-    font-size:12px;
-    color: var(--muted);
-    margin-bottom: 6px;
+    display:block;font-size:12px;color:var(--muted);
+    margin-bottom:6px;
   }
-  .right { text-align: left; }
-  .btnTiny, .btnBad { width: 100%; }
+  .right{text-align:left}
 }
 </style>
 </head>
@@ -441,48 +438,61 @@ input, button { font-size: 16px; } /* évite zoom iOS */
 
 <div class="wrap">
   <div class="card">
-    <h1>😈 ADMIN SP-SPOOF</h1>
-    <div class="sub">Clés • Copier • Neige • Temps restant live • Bulk • Export • Ban/Delete</div>
+    <h1>😈 SP-SPOOF ADMIN</h1>
+    <div class="sub">Keys • Device lock • Reset • Logs live • Share alert</div>
 
     <div class="row">
-      <input id="secret" class="grow" placeholder="ADMIN_SECRET (mot de passe)" type="password" />
+      <input id="secret" class="grow" placeholder="ADMIN_SECRET (mot de passe)" type="password"/>
       <button class="btn2" id="saveSecret">💾 Sauver</button>
+      <button class="btn2" id="refresh">🔄 Refresh</button>
     </div>
 
     <div class="hr"></div>
 
     <div class="row">
-      <input id="days" class="w120" value="30" type="number" min="1" max="3650" />
-      <input id="count" class="w120" value="1" type="number" min="1" max="100" />
-      <input id="note" class="grow" placeholder="Note (optionnel)" />
+      <input id="days" class="w140" type="number" value="30" min="1" max="3650"/>
+      <input id="count" class="w140" type="number" value="1" min="1" max="50"/>
+      <input id="note" class="grow" placeholder="Note (optionnel)"/>
       <button class="btn" id="gen">➕ Générer</button>
-      <button class="btn2" id="refresh">🔄 Actualiser</button>
-      <button class="btn2" id="export">📦 Export JSON</button>
+      <input id="search" class="grow" placeholder="Recherche clé / note / did..."/>
     </div>
 
     <div class="hr"></div>
 
     <div class="row">
-      <input id="search" class="grow" placeholder="Rechercher une clé / note..." />
       <span class="pill">Total: <b id="st_total">0</b></span>
       <span class="pill ok">Actives: <b id="st_active">0</b></span>
       <span class="pill warn">Expirées: <b id="st_expired">0</b></span>
       <span class="pill bad">Bannies: <b id="st_banned">0</b></span>
+      <span class="pill">Linked: <b id="st_linked">0</b></span>
+      <span class="pill">Live: <b id="st_live">ON</b></span>
     </div>
 
     <div class="hr"></div>
 
-    <table>
-      <thead>
-        <tr>
-          <th>Clé</th>
-          <th>Info</th>
-          <th>Temps restant</th>
-          <th class="right">Actions</th>
-        </tr>
-      </thead>
-      <tbody id="rows"></tbody>
-    </table>
+    <div class="panel">
+      <div class="box">
+        <div class="small">Clés</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Key</th><th>Status</th><th>Device</th><th>Time</th><th class="right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+
+      <div class="box">
+        <div class="row" style="justify-content:space-between">
+          <div class="small">Logs live (global + clé sélectionnée)</div>
+          <button class="btnTiny" id="toggleLive">⏸ Pause</button>
+        </div>
+        <div class="small" style="margin-top:6px">Sélection: <span class="mono" id="selKey">none</span></div>
+        <div class="logs" id="logs"></div>
+      </div>
+    </div>
+
   </div>
 </div>
 
@@ -490,38 +500,22 @@ input, button { font-size: 16px; } /* évite zoom iOS */
 
 <script>
 const $ = (id)=>document.getElementById(id);
+const API = location.origin;
+
+let live = true;
+let cache = { items: [], now: Date.now(), stats: {} };
+let selectedKey = "";
 
 const toast = (msg)=>{
   const t=$("toast");
   t.textContent=msg;
   t.style.display="block";
   clearTimeout(toast._t);
-  toast._t=setTimeout(()=>t.style.display="none",1600);
-};
-
-const loadSecret = ()=>{
-  const s = localStorage.getItem("SP_ADMIN_SECRET") || "";
-  $("secret").value = s;
-};
-
-$("saveSecret").onclick = ()=>{
-  localStorage.setItem("SP_ADMIN_SECRET", $("secret").value.trim());
-  toast("✅ Secret sauvegardé");
-};
-
-const post = async (path, body)=>{
-  const secret = $("secret").value.trim() || localStorage.getItem("SP_ADMIN_SECRET") || "";
-  const res = await fetch(path, {
-    method:"POST",
-    headers:{ "content-type":"application/json" },
-    body: JSON.stringify({ ...body, secret })
-  });
-  const j = await res.json().catch(()=>({ok:false,error:"bad_json"}));
-  if(!res.ok || !j.ok) throw new Error(j.error || j.reason || "Erreur API");
-  return j;
+  toast._t=setTimeout(()=>t.style.display="none",1500);
 };
 
 const msToClock = (ms)=>{
+  if (ms==null) return "∞";
   ms = Math.max(0, ms|0);
   const s = Math.floor(ms/1000);
   const d = Math.floor(s/86400);
@@ -529,125 +523,195 @@ const msToClock = (ms)=>{
   const m = Math.floor((s%3600)/60);
   const sec = s%60;
   const pad=(n)=>String(n).padStart(2,"0");
-  if(d>0) return d+"j "+pad(h)+":"+pad(m)+":"+pad(sec);
+  if(d>0) return d+"d "+pad(h)+":"+pad(m)+":"+pad(sec);
   return pad(h)+":"+pad(m)+":"+pad(sec);
 };
 
-let cache = { items:[], now: Date.now() };
+const secretVal = ()=> $("secret").value.trim() || localStorage.getItem("SP_ADMIN_SECRET") || "";
 
-const render = ()=>{
-  const q = $("search").value.trim().toLowerCase();
+const post = async (path, body)=>{
+  const res = await fetch(API+path,{
+    method:"POST",
+    headers:{ "content-type":"application/json", "x-admin-secret": secretVal() },
+    body: JSON.stringify(body||{})
+  });
+  const j = await res.json().catch(()=>({}));
+  if(!res.ok || !j.ok) throw new Error(j.reason || "API error");
+  return j;
+};
+
+$("saveSecret").onclick = ()=>{
+  localStorage.setItem("SP_ADMIN_SECRET", $("secret").value.trim());
+  toast("✅ secret saved");
+};
+
+$("toggleLive").onclick = ()=>{
+  live = !live;
+  $("st_live").textContent = live ? "ON" : "OFF";
+  $("toggleLive").textContent = live ? "⏸ Pause" : "▶️ Live";
+};
+
+function statusOf(it){
+  const expired = it.exp && cache.now >= it.exp;
+  if(it.banned) return "⛔ banned";
+  if(expired) return "⌛ expired";
+  return "✅ active";
+}
+
+function deviceOf(it){
+  return it.did ? ("📱 linked ("+ String(it.did).slice(0,10)+"…)") : "🟢 free";
+}
+
+function matchesSearch(it, q){
+  if(!q) return true;
+  const s = (it.key+" "+(it.note||"")+" "+(it.did||"")).toLowerCase();
+  return s.includes(q);
+}
+
+function buildLogs(items){
+  const out = [];
+  for(const it of items){
+    const logs = it.logs || [];
+    for(const l of logs){
+      out.push({ key: it.key, ...l });
+    }
+  }
+  out.sort((a,b)=>(a.t||0)-(b.t||0));
+  return out.slice(-25).reverse();
+}
+
+function renderLogs(){
+  const box = $("logs");
+  box.innerHTML = "";
+
+  const all = buildLogs(cache.items);
+
+  const filter = selectedKey ? all.filter(x=>x.key===selectedKey) : all;
+
+  for(const l of filter){
+    const div = document.createElement("div");
+    div.className="logItem";
+
+    let tagClass="tagInfo";
+    if(l.event==="login" || l.event==="first_lock") tagClass="tagLogin";
+    if(l.event==="share_attempt") tagClass="tagShare";
+
+    div.innerHTML = \`
+      <div>
+        <span class="tag \${tagClass}">\${l.event}</span>
+        <span class="mono">\${new Date(l.t).toLocaleTimeString()}</span>
+      </div>
+      <div class="small mono">\${selectedKey ? "" : ("KEY: "+l.key+" • ")}DID: \${(l.did||"").slice(0,18)}\${(l.did && l.did.length>18)?"…":""}</div>
+    \`;
+    box.appendChild(div);
+  }
+}
+
+function render(){
+  const q = ($("search").value||"").trim().toLowerCase();
   const rows = $("rows");
   rows.innerHTML = "";
 
-  const items = cache.items.filter(it=>{
-    if(!q) return true;
-    return (it.key||"").toLowerCase().includes(q) || (it.note||"").toLowerCase().includes(q);
-  });
+  const items = cache.items.filter(it=>matchesSearch(it,q));
 
   for(const it of items){
-    const exp = it.exp || null;
-    const remaining = exp ? (exp - cache.now) : null;
-    const expired = exp && remaining <= 0;
-    const status = it.banned ? "bannie" : (expired ? "expirée" : "active");
+    const expired = it.exp && cache.now >= it.exp;
+    const rem = it.exp ? (it.exp - cache.now) : null;
 
     const tr = document.createElement("tr");
 
-    const tdKey = document.createElement("td");
-    tdKey.className="mono";
-    tdKey.textContent = it.key;
-    tdKey.setAttribute("data-label","Clé");
-
-    const tdInfo = document.createElement("td");
-    tdInfo.setAttribute("data-label","Info");
-    tdInfo.innerHTML = \`
-      <div><b>\${status}</b> • <span class="small">uses: \${it.uses||0}</span></div>
-      <div class="small">\${it.note ? "📝 "+it.note : ""}</div>
+    tr.innerHTML = \`
+      <td data-label="Key" class="mono">\${it.key}</td>
+      <td data-label="Status">\${statusOf(it)}<div class="small">uses: \${it.uses||0}</div></td>
+      <td data-label="Device">\${deviceOf(it)}<div class="small">\${it.lockedAt ? ("locked: "+new Date(it.lockedAt).toLocaleString()) : ""}</div></td>
+      <td data-label="Time">
+        \${it.exp ? \`<div class="mono" data-exp="\${it.exp}">\${msToClock(rem)}</div><div class="small">exp: \${new Date(it.exp).toLocaleString()}</div>\` : \`<div class="mono">∞</div><div class="small">no expiry</div>\`}
+        \${it.note ? \`<div class="small">📝 \${it.note}</div>\` : "" }
+      </td>
+      <td data-label="Actions" class="right">
+        <button class="btnTiny" data-sel="\${it.key}">👁</button>
+        <button class="btnTiny" data-copy="\${it.key}">📋</button>
+        <button class="btnTiny" data-ban="\${it.key}" data-b="\${it.banned?1:0}">\${it.banned?"✅":"⛔"}</button>
+        <button class="btnTiny" data-reset="\${it.key}">🔓</button>
+        <button class="btnBad" data-del="\${it.key}">🗑</button>
+      </td>
     \`;
 
-    const tdTime = document.createElement("td");
-    tdTime.setAttribute("data-label","Temps restant");
-    tdTime.innerHTML = exp
-      ? \`<div class="mono" data-exp="\${exp}">\${msToClock(exp - cache.now)}</div>
-         <div class="small">exp: \${new Date(exp).toLocaleString()}</div>\`
-      : \`<div class="mono">∞</div><div class="small">sans expiration</div>\`;
-
-    const tdAct = document.createElement("td");
-    tdAct.setAttribute("data-label","Actions");
-    tdAct.className="right";
-    tdAct.innerHTML = \`
-      <button class="btnTiny" data-copy="\${it.key}">📋 Copier</button>
-      <button class="btnTiny" data-ban="\${it.key}" data-banned="\${it.banned ? 1 : 0}">
-        \${it.banned ? "✅ Unban" : "⛔ Ban"}
-      </button>
-      <button class="btnBad" data-del="\${it.key}">🗑️</button>
-    \`;
-
-    tr.appendChild(tdKey);
-    tr.appendChild(tdInfo);
-    tr.appendChild(tdTime);
-    tr.appendChild(tdAct);
     rows.appendChild(tr);
   }
 
-  rows.querySelectorAll("[data-copy]").forEach(btn=>{
-    btn.onclick = async ()=>{
-      const k = btn.getAttribute("data-copy");
-      try{
-        await navigator.clipboard.writeText(k);
-        toast("✅ Clé copiée");
-      }catch{
-        const ta=document.createElement("textarea");
-        ta.value=k; document.body.appendChild(ta);
-        ta.select(); document.execCommand("copy");
-        ta.remove();
-        toast("✅ Clé copiée");
-      }
+  rows.querySelectorAll("[data-copy]").forEach(b=>{
+    b.onclick = async ()=>{
+      const k = b.getAttribute("data-copy");
+      try{ await navigator.clipboard.writeText(k); toast("📋 copied"); }catch{ toast("❌ copy fail"); }
     };
   });
 
-  rows.querySelectorAll("[data-del]").forEach(btn=>{
-    btn.onclick = async ()=>{
-      const k = btn.getAttribute("data-del");
-      if(!confirm("Supprimer la clé ?\\n"+k)) return;
+  rows.querySelectorAll("[data-sel]").forEach(b=>{
+    b.onclick = ()=>{
+      selectedKey = b.getAttribute("data-sel");
+      $("selKey").textContent = selectedKey;
+      renderLogs();
+    };
+  });
+
+  rows.querySelectorAll("[data-ban]").forEach(b=>{
+    b.onclick = async ()=>{
+      const k = b.getAttribute("data-ban");
+      const banned = b.getAttribute("data-b")==="1";
       try{
-        await post("/api/admin/delete", { key:k });
-        toast("🗑️ supprimée");
+        await post("/api/admin/ban",{ key:k, banned: !banned });
+        toast(!banned ? "⛔ banned" : "✅ unbanned");
         await refresh();
       }catch(e){ toast("❌ "+e.message); }
     };
   });
 
-  rows.querySelectorAll("[data-ban]").forEach(btn=>{
-    btn.onclick = async ()=>{
-      const k = btn.getAttribute("data-ban");
-      const banned = btn.getAttribute("data-banned")==="1";
+  rows.querySelectorAll("[data-reset]").forEach(b=>{
+    b.onclick = async ()=>{
+      const k = b.getAttribute("data-reset");
+      if(!confirm("Reset device lock ?\\n"+k)) return;
       try{
-        await post("/api/admin/ban", { key:k, banned: !banned });
-        toast(!banned ? "⛔ bannie" : "✅ unban");
+        await post("/api/admin/reset",{ key:k });
+        toast("🔓 reset ok");
         await refresh();
       }catch(e){ toast("❌ "+e.message); }
     };
   });
-};
 
-const refresh = async ()=>{
+  rows.querySelectorAll("[data-del]").forEach(b=>{
+    b.onclick = async ()=>{
+      const k = b.getAttribute("data-del");
+      if(!confirm("Delete key ?\\n"+k)) return;
+      try{
+        await post("/api/admin/delete",{ key:k });
+        toast("🗑 deleted");
+        await refresh();
+      }catch(e){ toast("❌ "+e.message); }
+    };
+  });
+
+  renderLogs();
+}
+
+async function refresh(){
   try{
-    const j = await post("/api/admin/list", { limit: 500 });
+    const j = await post("/api/admin/list",{ limit: 600 });
     cache.items = j.items || [];
     cache.now = j.now || Date.now();
+    cache.stats = j.stats || {};
 
-    $("st_total").textContent = j.stats?.total ?? cache.items.length;
-    $("st_active").textContent = j.stats?.active ?? 0;
-    $("st_expired").textContent = j.stats?.expired ?? 0;
-    $("st_banned").textContent = j.stats?.banned ?? 0;
+    $("st_total").textContent = cache.stats.total || 0;
+    $("st_active").textContent = cache.stats.active || 0;
+    $("st_expired").textContent = cache.stats.expired || 0;
+    $("st_banned").textContent = cache.stats.banned || 0;
+    $("st_linked").textContent = cache.stats.linked || 0;
 
     render();
-    toast("🔄 OK");
   }catch(e){
     toast("❌ "+e.message);
   }
-};
+}
 
 $("refresh").onclick = refresh;
 $("search").oninput = render;
@@ -657,35 +721,20 @@ $("gen").onclick = async ()=>{
     const days = Number($("days").value || 30);
     const count = Number($("count").value || 1);
     const note = $("note").value || "";
-    const j = await post("/api/admin/create", { days, note, count });
-
+    const j = await post("/api/admin/create",{ days, count, note });
     const first = j.created?.[0]?.key;
     if(first){
       try{ await navigator.clipboard.writeText(first); }catch{}
-      toast("✅ Généré (1ère clé copiée)");
-    }else{
-      toast("✅ Généré");
-    }
-
-    $("note").value = "";
+      toast("✅ generated (first copied)");
+    }else toast("✅ generated");
+    $("note").value="";
     await refresh();
   }catch(e){ toast("❌ "+e.message); }
 };
 
-$("export").onclick = async ()=>{
-  try{
-    const j = await post("/api/admin/export", {});
-    const blob = new Blob([JSON.stringify(j.export, null, 2)], {type:"application/json"});
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "sp-spoof-keys-export.json";
-    a.click();
-    toast("📦 Export téléchargé");
-  }catch(e){ toast("❌ "+e.message); }
-};
-
-// Live countdown
+// live update countdown + logs
 setInterval(()=>{
+  if(!live) return;
   cache.now = Date.now();
   document.querySelectorAll("[data-exp]").forEach(el=>{
     const exp = Number(el.getAttribute("data-exp"));
@@ -693,14 +742,23 @@ setInterval(()=>{
   });
 }, 1000);
 
-// ❄️ Snow (canvas)
-const c = $("snow"), ctx = c.getContext("2d");
+// live refresh (logs live)
+setInterval(()=>{
+  if(!live) return;
+  refresh();
+}, 2500);
+
+// init
+$("secret").value = localStorage.getItem("SP_ADMIN_SECRET") || "";
+refresh();
+
+// ❄️ snow
+const c=$("snow"), ctx=c.getContext("2d");
 const resize=()=>{ c.width=innerWidth*devicePixelRatio; c.height=innerHeight*devicePixelRatio; };
 resize(); addEventListener("resize", resize);
 
 const flakes = Array.from({length: 110}, ()=>({
-  x: Math.random(),
-  y: Math.random(),
+  x: Math.random(), y: Math.random(),
   r: 0.6 + Math.random()*1.8,
   s: 0.15 + Math.random()*0.65,
   w: (Math.random()-0.5)*0.25,
@@ -708,7 +766,7 @@ const flakes = Array.from({length: 110}, ()=>({
 }));
 
 (function loop(){
-  const w=c.width, h=c.height;
+  const w=c.width,h=c.height;
   ctx.clearRect(0,0,w,h);
   for(const f of flakes){
     f.y += f.s * 0.003 * h;
@@ -719,15 +777,11 @@ const flakes = Array.from({length: 110}, ()=>({
     ctx.globalAlpha = f.a;
     ctx.beginPath();
     ctx.arc(f.x*w, f.y*h, f.r*devicePixelRatio, 0, Math.PI*2);
-    ctx.fillStyle = "#ffffff";
+    ctx.fillStyle="#ffffff";
     ctx.fill();
   }
   requestAnimationFrame(loop);
 })();
-
-// init
-loadSecret();
-refresh();
 </script>
 </body>
 </html>`;
