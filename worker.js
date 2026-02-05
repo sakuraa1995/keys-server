@@ -1,383 +1,733 @@
 export default {
-  async fetch(request, env) {
-    try {
-      const url = new URL(request.url);
-      const path = url.pathname;
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const now = Date.now();
 
-      // CORS preflight
-      if (request.method === "OPTIONS") return cors(new Response("", { status: 204 }));
+    // ---------- helpers ----------
+    const json = (obj, status = 200, extraHeaders = {}) =>
+      new Response(JSON.stringify(obj), {
+        status,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+          ...extraHeaders,
+        },
+      });
 
-      // ---------- HOME ----------
-      if (path === "/" || path === "/health") {
-        return cors(json({ ok: true, online: true, ts: Date.now() }));
+    const html = (str, status = 200, extraHeaders = {}) =>
+      new Response(str, {
+        status,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+          ...extraHeaders,
+        },
+      });
+
+    const text = (str, status = 200, extraHeaders = {}) =>
+      new Response(str, {
+        status,
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+          "cache-control": "no-store",
+          ...extraHeaders,
+        },
+      });
+
+    const cors = (res) => {
+      const h = new Headers(res.headers);
+      h.set("Access-Control-Allow-Origin", "*");
+      h.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      h.set("Access-Control-Allow-Headers", "content-type, x-admin-secret");
+      h.set("Access-Control-Max-Age", "86400");
+      return new Response(res.body, { status: res.status, headers: h });
+    };
+
+    const safeJson = async (req) => {
+      try {
+        return await req.json();
+      } catch {
+        return null;
       }
+    };
 
-      // ---------- ADMIN PANEL (UI) ----------
-      if (path === "/admin" && request.method === "GET") {
-        return cors(new Response(adminHtml(), {
-          status: 200,
-          headers: { "content-type": "text/html; charset=utf-8" }
-        }));
-      }
+    const requireKV = () => {
+      if (!env.KEYS_DB) throw new Error("KV binding manquant: KEYS_DB");
+    };
 
-      // ---------- CLIENT CHECK ----------
-      // /api/check?key=...&did=...
-      if (path === "/api/check") {
-        const key = (url.searchParams.get("key") || "").trim();
-        const did = (url.searchParams.get("did") || "").trim();
+    const requireAdminSecret = () => {
+      if (!env.ADMIN_SECRET) throw new Error("Variable manquante: ADMIN_SECRET");
+    };
 
-        if (!key) return cors(json({ ok: false, reason: "missing_key" }, 400));
-        if (!did) return cors(json({ ok: false, reason: "missing_device" }, 400));
+    const isAuthed = (secret) => String(secret || "") === String(env.ADMIN_SECRET || "");
 
-        const rec = await getKey(env, key);
-        if (!rec) return cors(json({ ok: false, reason: "not_found" }, 404));
-        if (rec.banned) return cors(json({ ok: false, reason: "banned" }, 403));
+    const kvKey = (key) => `KEY:${key}`;
 
-        const now = Date.now();
-        if (rec.exp && now > rec.exp) {
-          return cors(json({ ok: false, reason: "expired", exp: rec.exp }, 403));
-        }
+    const randomKey = () => {
+      const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sans 0/O/I/1
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      let s = "";
+      for (let i = 0; i < bytes.length; i++) s += alphabet[bytes[i] % alphabet.length];
+      return `SP-${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}`;
+    };
 
-        // device lock (1 appareil)
-        if (!rec.device) {
-          rec.device = did;
-          rec.lockedAt = rec.lockedAt || now;
-          await putKey(env, key, rec);
-        } else if (rec.device !== did) {
-          return cors(json({
-            ok: false,
-            reason: "device_mismatch",
-            lockedDevice: rec.device,
-            lockedAt: rec.lockedAt || null
-          }, 403));
-        }
+    const discord = async (content) => {
+      if (!env.DISCORD_WEBHOOK) return;
+      try {
+        await fetch(env.DISCORD_WEBHOOK, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ content }),
+        });
+      } catch {}
+    };
 
-        const remainingMs = rec.exp ? Math.max(0, rec.exp - now) : null;
+    // ---------- preflight ----------
+    if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
 
-        return cors(json({
-          ok: true,
-          key,
-          did,
-          remainingMs,
-          exp: rec.exp || null,
-          banned: !!rec.banned,
-          device: rec.device || null,
-          lockedAt: rec.lockedAt || null
-        }));
-      }
-
-      // ---------- ADMIN API ----------
-      if (path.startsWith("/api/admin/")) {
-        const adminKey = request.headers.get("x-admin-key") || (url.searchParams.get("admin") || "");
-        if (!env.ADMIN_KEY || adminKey !== env.ADMIN_KEY) {
-          return cors(json({ ok: false, reason: "unauthorized" }, 401));
-        }
-
-        // GET /api/admin/get?key=...
-        if (path === "/api/admin/get" && request.method === "GET") {
-          const key = (url.searchParams.get("key") || "").trim();
-          if (!key) return cors(json({ ok: false, reason: "missing_key" }, 400));
-          const rec = await getKey(env, key);
-          if (!rec) return cors(json({ ok: false, reason: "not_found" }, 404));
-          return cors(json({ ok: true, key, rec }));
-        }
-
-        // POST /api/admin/add { key, minutes? , hours? , days? , exp? }
-        if (path === "/api/admin/add" && request.method === "POST") {
-          const body = await safeJson(request);
-          const key = (body?.key || "").trim();
-          if (!key) return cors(json({ ok: false, reason: "missing_key" }, 400));
-
-          const now = Date.now();
-          let exp = null;
-
-          if (typeof body?.exp === "number") {
-            exp = body.exp;
-          } else {
-            const days = Number(body?.days || 0);
-            const hours = Number(body?.hours || 0);
-            const minutes = Number(body?.minutes || 0);
-            const ms = ((days * 24 + hours) * 60 + minutes) * 60 * 1000;
-            exp = ms > 0 ? now + ms : null; // null = infinite
-          }
-
-          const rec = {
-            createdAt: now,
-            exp,
-            banned: false,
-            device: null,
-            lockedAt: null
-          };
-
-          await putKey(env, key, rec);
-          return cors(json({ ok: true, key, rec }));
-        }
-
-        // POST /api/admin/ban { key, banned: true/false }
-        if (path === "/api/admin/ban" && request.method === "POST") {
-          const body = await safeJson(request);
-          const key = (body?.key || "").trim();
-          const banned = !!body?.banned;
-          if (!key) return cors(json({ ok: false, reason: "missing_key" }, 400));
-
-          const rec = await getKey(env, key);
-          if (!rec) return cors(json({ ok: false, reason: "not_found" }, 404));
-
-          rec.banned = banned;
-          await putKey(env, key, rec);
-          return cors(json({ ok: true, key, banned }));
-        }
-
-        // POST /api/admin/extend { key, addMinutes }
-        if (path === "/api/admin/extend" && request.method === "POST") {
-          const body = await safeJson(request);
-          const key = (body?.key || "").trim();
-          const addMinutes = Number(body?.addMinutes || 0);
-          if (!key) return cors(json({ ok: false, reason: "missing_key" }, 400));
-          if (!Number.isFinite(addMinutes) || addMinutes === 0) {
-            return cors(json({ ok: false, reason: "bad_addMinutes" }, 400));
-          }
-
-          const rec = await getKey(env, key);
-          if (!rec) return cors(json({ ok: false, reason: "not_found" }, 404));
-
-          // infinite key: no change
-          if (rec.exp == null) return cors(json({ ok: true, key, exp: null, note: "infinite_key_no_change" }));
-
-          const now = Date.now();
-          const addMs = addMinutes * 60 * 1000;
-          const base = Math.max(now, rec.exp);
-          rec.exp = base + addMs;
-
-          await putKey(env, key, rec);
-          return cors(json({ ok: true, key, exp: rec.exp }));
-        }
-
-        // POST /api/admin/resetDevice { key }
-        if (path === "/api/admin/resetDevice" && request.method === "POST") {
-          const body = await safeJson(request);
-          const key = (body?.key || "").trim();
-          if (!key) return cors(json({ ok: false, reason: "missing_key" }, 400));
-
-          const rec = await getKey(env, key);
-          if (!rec) return cors(json({ ok: false, reason: "not_found" }, 404));
-
-          rec.device = null;
-          rec.lockedAt = null;
-          await putKey(env, key, rec);
-
-          return cors(json({ ok: true, key, reset: true }));
-        }
-
-        // POST /api/admin/delete { key }
-        if (path === "/api/admin/delete" && request.method === "POST") {
-          const body = await safeJson(request);
-          const key = (body?.key || "").trim();
-          if (!key) return cors(json({ ok: false, reason: "missing_key" }, 400));
-
-          await env.LICENSES.delete(kvKey(key));
-          return cors(json({ ok: true, key, deleted: true }));
-        }
-
-        return cors(json({ ok: false, reason: "unknown_admin_route" }, 404));
-      }
-
-      return cors(json({ ok: false, reason: "not_found" }, 404));
-    } catch (e) {
-      return cors(json({ ok: false, reason: "server_error", message: String(e?.message || e) }, 500));
+    // ---------- health ----------
+    if (path === "/" || path === "/health") {
+      return cors(json({ ok: true, hasKV: !!env.KEYS_DB, now }, 200));
     }
-  }
+
+    // =========================================================
+    // ✅ PUBLIC API: check key (used by Stay)
+    // GET /api/check?key=SP-XXXX-XXXX-XXXX&did=DEVICE_ID
+    // ✅ 1 clé = 1 appareil (lock)
+    // =========================================================
+    if (path === "/api/check" && request.method === "GET") {
+      requireKV();
+      const key = (url.searchParams.get("key") || "").trim();
+      const did = (url.searchParams.get("did") || "").trim(); // <- device id venant du script Stay
+
+      if (!key) return cors(json({ ok: false, reason: "missing_key" }, 400));
+      if (!did) return cors(json({ ok: false, reason: "missing_device" }, 400));
+
+      const raw = await env.KEYS_DB.get(kvKey(key));
+      if (!raw) return cors(json({ ok: false, reason: "not_found" }, 404));
+
+      let rec;
+      try {
+        rec = JSON.parse(raw);
+      } catch {
+        return cors(json({ ok: false, reason: "bad_record" }, 500));
+      }
+
+      // sécurité si vieux records
+      if (typeof rec !== "object" || rec == null) rec = {};
+      if (typeof rec.banned !== "boolean") rec.banned = !!rec.banned;
+      if (typeof rec.uses !== "number") rec.uses = Number(rec.uses || 0) || 0;
+
+      if (rec.banned) return cors(json({ ok: false, reason: "banned" }, 403));
+      if (typeof rec.exp === "number" && now >= rec.exp) return cors(json({ ok: false, reason: "expired" }, 403));
+
+      // ✅ DEVICE LOCK (1 appareil max)
+      if (!rec.did) {
+        // 1ère utilisation => on lock
+        rec.did = did;
+        rec.lockedAt = rec.lockedAt || now;
+      } else if (String(rec.did) !== String(did)) {
+        // déjà lock sur un autre appareil
+        return cors(
+          json(
+            {
+              ok: false,
+              reason: "device_mismatch",
+              lockedAt: rec.lockedAt || null,
+            },
+            403
+          )
+        );
+      }
+
+      // touches / uses (seulement si OK)
+      rec.uses = (rec.uses || 0) + 1;
+      await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
+
+      return cors(
+        json(
+          {
+            ok: true,
+            key,
+            exp: rec.exp || null,
+            remainingMs: rec.exp ? Math.max(0, rec.exp - now) : null,
+            note: rec.note || "",
+            uses: rec.uses || 0,
+            did: rec.did || null, // (pas obligatoire côté client, mais utile)
+          },
+          200
+        )
+      );
+    }
+
+    // =========================================================
+    // ✅ ADMIN UI
+    // GET /admin
+    // (INCHANGÉ)
+    // =========================================================
+    if (path === "/admin" && request.method === "GET") {
+      requireAdminSecret();
+      return html(ADMIN_HTML);
+    }
+
+    // =========================================================
+    // ✅ ADMIN API (POST JSON) - requires secret
+    // (INCHANGÉ sauf: on stocke did/lockedAt à null à la création)
+    // =========================================================
+    if (path.startsWith("/api/admin/")) {
+      requireKV();
+      requireAdminSecret();
+
+      const body = await safeJson(request);
+      const secret = body?.secret || request.headers.get("x-admin-secret");
+
+      if (!isAuthed(secret)) return cors(json({ ok: false, error: "unauthorized" }, 401));
+
+      // LIST keys
+      if (path === "/api/admin/list" && request.method === "POST") {
+        const limit = Math.min(800, Math.max(1, Number(body?.limit ?? 300)));
+        const res = await env.KEYS_DB.list({ prefix: "KEY:", limit: 1000 });
+
+        const items = [];
+        for (const k of res.keys) {
+          const raw = await env.KEYS_DB.get(k.name);
+          if (!raw) continue;
+          try {
+            const d = JSON.parse(raw);
+            items.push({
+              key: k.name.replace(/^KEY:/, ""),
+              banned: !!d.banned,
+              exp: typeof d.exp === "number" ? d.exp : null,
+              created: typeof d.created === "number" ? d.created : null,
+              note: d.note || "",
+              uses: d.uses || 0,
+              // champs lock (ne change pas ton UI)
+              did: d.did || null,
+              lockedAt: typeof d.lockedAt === "number" ? d.lockedAt : null,
+            });
+            if (items.length >= limit) break;
+          } catch {}
+        }
+
+        // stats
+        const stats = {
+          total: items.length,
+          active: items.filter((x) => !x.banned && (!x.exp || now < x.exp)).length,
+          expired: items.filter((x) => x.exp && now >= x.exp).length,
+          banned: items.filter((x) => x.banned).length,
+        };
+
+        // newest first
+        items.sort((a, b) => (b.created || 0) - (a.created || 0));
+
+        return cors(json({ ok: true, items, stats, now }, 200));
+      }
+
+      // CREATE keys (bulk)
+      if (path === "/api/admin/create" && request.method === "POST") {
+        const days = Math.max(1, Math.min(3650, Number(body?.days ?? 30)));
+        const count = Math.max(1, Math.min(100, Number(body?.count ?? 1)));
+        const note = String(body?.note ?? "").slice(0, 120);
+
+        const created = [];
+        for (let i = 0; i < count; i++) {
+          const key = randomKey();
+          const exp = now + days * 86400000;
+          // ✅ ajout did/lockedAt à null (compat)
+          const rec = { banned: false, exp, created: now, note, uses: 0, did: null, lockedAt: null };
+          await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
+          created.push({ key, exp, note });
+        }
+
+        ctx.waitUntil(discord(`🟣 SP-SPOOF | ${count} clé(s) créée(s) (${days}j) ✅`));
+        return cors(json({ ok: true, created, now }, 200));
+      }
+
+      // BAN / UNBAN
+      if (path === "/api/admin/ban" && request.method === "POST") {
+        const key = String(body?.key || "").trim();
+        const banned = !!body?.banned;
+        if (!key) return cors(json({ ok: false, error: "missing_key" }, 400));
+
+        const raw = await env.KEYS_DB.get(kvKey(key));
+        if (!raw) return cors(json({ ok: false, error: "not_found" }, 404));
+
+        const rec = JSON.parse(raw);
+        rec.banned = banned;
+        await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
+
+        ctx.waitUntil(discord(`${banned ? "⛔️" : "✅"} SP-SPOOF | ${banned ? "Ban" : "Unban"}: \`${key}\``));
+        return cors(json({ ok: true, banned }, 200));
+      }
+
+      // DELETE
+      if (path === "/api/admin/delete" && request.method === "POST") {
+        const key = String(body?.key || "").trim();
+        if (!key) return cors(json({ ok: false, error: "missing_key" }, 400));
+
+        await env.KEYS_DB.delete(kvKey(key));
+        ctx.waitUntil(discord(`🗑️ SP-SPOOF | Clé supprimée: \`${key}\``));
+        return cors(json({ ok: true }, 200));
+      }
+
+      // EXPORT
+      if (path === "/api/admin/export" && request.method === "POST") {
+        const res = await env.KEYS_DB.list({ prefix: "KEY:", limit: 1000 });
+        const out = [];
+        for (const k of res.keys) {
+          const raw = await env.KEYS_DB.get(k.name);
+          if (!raw) continue;
+          try {
+            out.push({ key: k.name.replace(/^KEY:/, ""), data: JSON.parse(raw) });
+          } catch {}
+        }
+        return cors(json({ ok: true, export: out, now }, 200));
+      }
+
+      return cors(json({ ok: false, error: "not_found" }, 404));
+    }
+
+    return text("Not found", 404);
+  },
 };
 
-function kvKey(key) { return `lic:${key}`; }
-
-async function getKey(env, key) {
-  const raw = await env.LICENSES.get(kvKey(key));
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
-}
-
-async function putKey(env, key, obj) {
-  await env.LICENSES.put(kvKey(key), JSON.stringify(obj));
-}
-
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj, null, 2), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8" }
-  });
-}
-
-function cors(res) {
-  const h = new Headers(res.headers);
-  h.set("access-control-allow-origin", "*");
-  h.set("access-control-allow-methods", "GET,POST,OPTIONS");
-  h.set("access-control-allow-headers", "content-type,x-admin-key");
-  return new Response(res.body, { status: res.status, headers: h });
-}
-
-async function safeJson(request) {
-  try { return await request.json(); } catch { return null; }
-}
-
-function adminHtml() {
-  return `<!doctype html>
-<html>
+// =========================
+// ADMIN PANEL (RESPONSIVE)
+// (INCHANGÉ)
+// =========================
+const ADMIN_HTML = `<!doctype html>
+<html lang="fr">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>SP Admin</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ADMIN SP-SPOOF</title>
 <style>
-  body{margin:0;background:#070b12;color:#eaf2ff;font-family:ui-monospace,Menlo,monospace}
-  .wrap{max-width:980px;margin:0 auto;padding:16px}
-  .card{background:linear-gradient(180deg,rgba(8,14,30,.92),rgba(3,6,16,.92));border:1px solid rgba(90,140,255,.25);border-radius:18px;padding:14px;box-shadow:0 18px 60px rgba(0,0,0,.55)}
-  .row{display:flex;gap:10px;flex-wrap:wrap}
-  input,button,select{border-radius:14px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:#fff;padding:10px 12px;font-family:inherit}
-  button{cursor:pointer}
-  .btn{border-color:rgba(255,60,90,.35)}
-  .btn2{border-color:rgba(90,140,255,.35)}
-  .small{font-size:12px;opacity:.75}
-  table{width:100%;border-collapse:collapse;margin-top:12px}
-  th,td{padding:10px;border-bottom:1px solid rgba(255,255,255,.08);font-size:12px}
-  .pill{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.14);font-size:11px}
+:root{
+  --bg:#060912;
+  --stroke:#1c2b55;
+  --txt:#dbe6ff;
+  --muted:#8ea7ffcc;
+  --ok:#34d399;
+  --bad:#fb7185;
+  --warn:#fbbf24;
+  --shadow: 0 14px 60px rgba(0,0,0,.55);
+}
+*{box-sizing:border-box}
+body{
+  margin:0; min-height:100vh; overflow-x:hidden;
+  background: radial-gradient(1200px 700px at 20% 0%, #0a1c55 0%, transparent 55%),
+              radial-gradient(900px 600px at 80% 10%, #3b0764 0%, transparent 55%),
+              var(--bg);
+  color:var(--txt);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+}
+.wrap{max-width:980px;margin:0 auto;padding:18px}
+.card{
+  position:relative;
+  border:1px solid var(--stroke);
+  background:linear-gradient(180deg, rgba(12,18,40,.85), rgba(7,10,20,.55));
+  border-radius:18px;
+  box-shadow:var(--shadow);
+  padding:16px;
+  overflow:hidden;
+}
+h1{margin:0 0 6px;font-size:20px;letter-spacing:.6px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:14px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+input, button{
+  border-radius:14px;
+  border:1px solid var(--stroke);
+  background:rgba(6,10,20,.7);
+  color:var(--txt);
+  padding:12px 12px;
+  outline:none;
+}
+input::placeholder{color:#90a4ff66}
+.grow{flex:1}
+.w120{width:120px}
+.btn{
+  background:linear-gradient(180deg, rgba(14,165,233,.25), rgba(14,165,233,.08));
+  border:1px solid rgba(14,165,233,.55);
+  cursor:pointer;
+  font-weight:800;
+}
+.btn2{
+  background:linear-gradient(180deg, rgba(59,130,246,.35), rgba(59,130,246,.10));
+  border:1px solid rgba(59,130,246,.55);
+  cursor:pointer;
+  font-weight:800;
+}
+.btnBad{
+  background:linear-gradient(180deg, rgba(244,63,94,.25), rgba(244,63,94,.08));
+  border:1px solid rgba(244,63,94,.55);
+  cursor:pointer;
+  font-weight:900;
+  padding:10px 12px;
+}
+.btnTiny{
+  padding:8px 10px;
+  border-radius:12px;
+  font-size:13px;
+  cursor:pointer;
+  border:1px solid var(--stroke);
+  background:rgba(10,18,40,.65);
+}
+.pill{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:7px 10px;border-radius:999px;border:1px solid var(--stroke);
+  background:rgba(10,18,40,.55);font-size:13px;color:var(--muted)
+}
+.ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+.hr{height:1px;background:rgba(255,255,255,.06);margin:14px 0}
+table{width:100%;border-collapse:separate;border-spacing:0 10px}
+th{font-size:12px;color:var(--muted);text-align:left;padding:0 10px}
+td{padding:12px 10px;background:rgba(10,18,40,.55);border:1px solid rgba(28,43,85,.75)}
+td:first-child{border-radius:14px 0 0 14px}
+td:last-child{border-radius:0 14px 14px 0}
+.mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace}
+.right{text-align:right}
+.small{font-size:12px;color:var(--muted)}
+.toast{
+  position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
+  background:rgba(0,0,0,.65);border:1px solid rgba(255,255,255,.12);
+  padding:10px 14px;border-radius:14px;backdrop-filter: blur(10px);
+  display:none;z-index:3;
+}
+/* ❄️ snow */
+.snow{position:fixed;inset:0;pointer-events:none;z-index:2;opacity:.9}
+
+/* =========================
+   📱 Mobile Responsive
+   ========================= */
+input, button { font-size: 16px; } /* évite zoom iOS */
+
+@media (max-width: 520px) {
+  .wrap { padding: 12px; }
+  .card { padding: 12px; border-radius: 16px; }
+  h1 { font-size: 18px; }
+  .sub { font-size: 12px; }
+
+  .row { gap: 8px; }
+  .w120 { width: 100%; }
+  .grow { flex: 1 1 100%; }
+  .pill { width: 100%; justify-content: space-between; }
+
+  /* Table -> Cards */
+  table, thead, tbody, th, tr { display: block; width: 100%; }
+  thead { display: none; }
+  tr { margin-bottom: 10px; }
+  td {
+    display: block;
+    width: 100%;
+    border-radius: 14px !important;
+    margin-top: 8px;
+  }
+  td[data-label]::before{
+    content: attr(data-label);
+    display:block;
+    font-size:12px;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .right { text-align: left; }
+  .btnTiny, .btnBad { width: 100%; }
+}
 </style>
 </head>
 <body>
+<canvas class="snow" id="snow"></canvas>
+
 <div class="wrap">
   <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
-      <div>
-        <div style="font-weight:900;letter-spacing:.18em">SP-SPOOF ADMIN</div>
-        <div class="small">Generate / Ban / Reset device / Delete</div>
-      </div>
-      <div class="row">
-        <input id="adminKey" placeholder="ADMIN_KEY"/>
-        <button class="btn2" onclick="saveKey()">Save</button>
-      </div>
-    </div>
-
-    <hr style="border:none;border-top:1px solid rgba(255,255,255,.08);margin:14px 0"/>
+    <h1>😈 ADMIN SP-SPOOF</h1>
+    <div class="sub">Clés • Copier • Neige • Temps restant live • Bulk • Export • Ban/Delete</div>
 
     <div class="row">
-      <input id="newKey" placeholder="Key (blank = auto)"/>
-      <input id="days" type="number" placeholder="Days" style="width:90px"/>
-      <input id="hours" type="number" placeholder="Hours" style="width:90px"/>
-      <input id="minutes" type="number" placeholder="Minutes" style="width:90px"/>
-      <button class="btn" onclick="gen()">Generate/Add</button>
+      <input id="secret" class="grow" placeholder="ADMIN_SECRET (mot de passe)" type="password" />
+      <button class="btn2" id="saveSecret">💾 Sauver</button>
     </div>
 
-    <div class="row" style="margin-top:10px">
-      <input id="searchKey" placeholder="Search key"/>
-      <button class="btn2" onclick="getOne()">Get</button>
-      <button class="btn2" onclick="copyKey()">Copy</button>
-      <button class="btn" onclick="ban(true)">Ban</button>
-      <button class="btn2" onclick="ban(false)">Unban</button>
-      <button class="btn2" onclick="resetDevice()">Reset device</button>
-      <button class="btn" onclick="delKey()">Delete</button>
+    <div class="hr"></div>
+
+    <div class="row">
+      <input id="days" class="w120" value="30" type="number" min="1" max="3650" />
+      <input id="count" class="w120" value="1" type="number" min="1" max="100" />
+      <input id="note" class="grow" placeholder="Note (optionnel)" />
+      <button class="btn" id="gen">➕ Générer</button>
+      <button class="btn2" id="refresh">🔄 Actualiser</button>
+      <button class="btn2" id="export">📦 Export JSON</button>
     </div>
 
-    <div id="out" class="small" style="margin-top:10px"></div>
+    <div class="hr"></div>
+
+    <div class="row">
+      <input id="search" class="grow" placeholder="Rechercher une clé / note..." />
+      <span class="pill">Total: <b id="st_total">0</b></span>
+      <span class="pill ok">Actives: <b id="st_active">0</b></span>
+      <span class="pill warn">Expirées: <b id="st_expired">0</b></span>
+      <span class="pill bad">Bannies: <b id="st_banned">0</b></span>
+    </div>
+
+    <div class="hr"></div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Clé</th>
+          <th>Info</th>
+          <th>Temps restant</th>
+          <th class="right">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
   </div>
 </div>
 
+<div class="toast" id="toast"></div>
+
 <script>
-const API_BASE = location.origin;
+const $ = (id)=>document.getElementById(id);
 
-function randKey(){
-  const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let s="";
-  for(let i=0;i<20;i++) s+=chars[Math.floor(Math.random()*chars.length)];
-  return "SP-" + s;
-}
-function fmt(ms){
-  if(ms==null) return "∞";
-  ms=Math.max(0, ms);
-  const s=Math.floor(ms/1000);
-  const d=Math.floor(s/86400);
-  const h=Math.floor((s%86400)/3600);
-  const m=Math.floor((s%3600)/60);
-  if(d>0) return d+"d "+h+"h";
-  if(h>0) return h+"h "+m+"m";
-  if(m>0) return m+"m";
-  return (s%60)+"s";
-}
+const toast = (msg)=>{
+  const t=$("toast");
+  t.textContent=msg;
+  t.style.display="block";
+  clearTimeout(toast._t);
+  toast._t=setTimeout(()=>t.style.display="none",1600);
+};
 
-function saveKey(){
-  localStorage.setItem("ADMIN_KEY", document.getElementById("adminKey").value.trim());
-  log("✅ admin key saved");
-}
-function adminKey(){
-  return (document.getElementById("adminKey").value.trim() || localStorage.getItem("ADMIN_KEY") || "").trim();
-}
+const loadSecret = ()=>{
+  const s = localStorage.getItem("SP_ADMIN_SECRET") || "";
+  $("secret").value = s;
+};
 
-async function api(path, opts={}){
-  const key=adminKey();
-  if(!key){ log("❌ missing admin key"); throw new Error("no admin"); }
-  const headers = Object.assign({}, opts.headers||{}, { "x-admin-key": key, "content-type":"application/json" });
-  const res = await fetch(API_BASE+path, Object.assign({}, opts, { headers }));
-  const j = await res.json().catch(()=>({}));
-  if(!res.ok) throw new Error(j.reason||("http "+res.status));
+$("saveSecret").onclick = ()=>{
+  localStorage.setItem("SP_ADMIN_SECRET", $("secret").value.trim());
+  toast("✅ Secret sauvegardé");
+};
+
+const post = async (path, body)=>{
+  const secret = $("secret").value.trim() || localStorage.getItem("SP_ADMIN_SECRET") || "";
+  const res = await fetch(path, {
+    method:"POST",
+    headers:{ "content-type":"application/json" },
+    body: JSON.stringify({ ...body, secret })
+  });
+  const j = await res.json().catch(()=>({ok:false,error:"bad_json"}));
+  if(!res.ok || !j.ok) throw new Error(j.error || j.reason || "Erreur API");
   return j;
-}
+};
 
-function log(s){ document.getElementById("out").textContent = s; }
+const msToClock = (ms)=>{
+  ms = Math.max(0, ms|0);
+  const s = Math.floor(ms/1000);
+  const d = Math.floor(s/86400);
+  const h = Math.floor((s%86400)/3600);
+  const m = Math.floor((s%3600)/60);
+  const sec = s%60;
+  const pad=(n)=>String(n).padStart(2,"0");
+  if(d>0) return d+"j "+pad(h)+":"+pad(m)+":"+pad(sec);
+  return pad(h)+":"+pad(m)+":"+pad(sec);
+};
 
-async function gen(){
-  const kIn = document.getElementById("newKey").value.trim();
-  const key = kIn || randKey();
-  const days = Number(document.getElementById("days").value||0);
-  const hours = Number(document.getElementById("hours").value||0);
-  const minutes = Number(document.getElementById("minutes").value||0);
+let cache = { items:[], now: Date.now() };
 
-  const j = await api("/api/admin/add", { method:"POST", body: JSON.stringify({ key, days, hours, minutes }) });
-  log("✅ added: " + j.key + " (exp: " + (j.rec.exp? new Date(j.rec.exp).toLocaleString() : "∞") + ")");
-  document.getElementById("searchKey").value = j.key;
-}
+const render = ()=>{
+  const q = $("search").value.trim().toLowerCase();
+  const rows = $("rows");
+  rows.innerHTML = "";
 
-async function getOne(){
-  const key = document.getElementById("searchKey").value.trim();
-  if(!key){ log("❌ enter key"); return; }
-  const j = await api("/api/admin/get?key="+encodeURIComponent(key), { method:"GET" });
-  const rec = j.rec;
-  const now = Date.now();
-  const rem = rec.exp ? Math.max(0, rec.exp - now) : null;
+  const items = cache.items.filter(it=>{
+    if(!q) return true;
+    return (it.key||"").toLowerCase().includes(q) || (it.note||"").toLowerCase().includes(q);
+  });
 
-  log("✅ key: " + key +
-      " | banned: " + !!rec.banned +
-      " | remaining: " + fmt(rem) +
-      " | device: " + (rec.device? (rec.device.slice(0,10)+"…") : "none"));
-}
+  for(const it of items){
+    const exp = it.exp || null;
+    const remaining = exp ? (exp - cache.now) : null;
+    const expired = exp && remaining <= 0;
+    const status = it.banned ? "bannie" : (expired ? "expirée" : "active");
 
-function copyKey(){
-  const key = document.getElementById("searchKey").value.trim();
-  if(!key){ log("❌ no key"); return; }
-  navigator.clipboard.writeText(key).then(()=>log("📋 copied: " + key)).catch(()=>log("❌ copy failed"));
-}
+    const tr = document.createElement("tr");
 
-async function ban(v){
-  const key = document.getElementById("searchKey").value.trim();
-  if(!key){ log("❌ enter key"); return; }
-  const j = await api("/api/admin/ban", { method:"POST", body: JSON.stringify({ key, banned: v }) });
-  log("✅ " + (v ? "banned" : "unbanned") + ": " + j.key);
-}
+    const tdKey = document.createElement("td");
+    tdKey.className="mono";
+    tdKey.textContent = it.key;
+    tdKey.setAttribute("data-label","Clé");
 
-async function resetDevice(){
-  const key = document.getElementById("searchKey").value.trim();
-  if(!key){ log("❌ enter key"); return; }
-  const j = await api("/api/admin/resetDevice", { method:"POST", body: JSON.stringify({ key }) });
-  log("✅ device reset: " + j.key);
-}
+    const tdInfo = document.createElement("td");
+    tdInfo.setAttribute("data-label","Info");
+    tdInfo.innerHTML = \`
+      <div><b>\${status}</b> • <span class="small">uses: \${it.uses||0}</span></div>
+      <div class="small">\${it.note ? "📝 "+it.note : ""}</div>
+    \`;
 
-async function delKey(){
-  const key = document.getElementById("searchKey").value.trim();
-  if(!key){ log("❌ enter key"); return; }
-  const j = await api("/api/admin/delete", { method:"POST", body: JSON.stringify({ key }) });
-  log("🗑️ deleted: " + j.key);
-}
+    const tdTime = document.createElement("td");
+    tdTime.setAttribute("data-label","Temps restant");
+    tdTime.innerHTML = exp
+      ? \`<div class="mono" data-exp="\${exp}">\${msToClock(exp - cache.now)}</div>
+         <div class="small">exp: \${new Date(exp).toLocaleString()}</div>\`
+      : \`<div class="mono">∞</div><div class="small">sans expiration</div>\`;
 
-// load saved admin key into input
-document.getElementById("adminKey").value = localStorage.getItem("ADMIN_KEY") || "";
+    const tdAct = document.createElement("td");
+    tdAct.setAttribute("data-label","Actions");
+    tdAct.className="right";
+    tdAct.innerHTML = \`
+      <button class="btnTiny" data-copy="\${it.key}">📋 Copier</button>
+      <button class="btnTiny" data-ban="\${it.key}" data-banned="\${it.banned ? 1 : 0}">
+        \${it.banned ? "✅ Unban" : "⛔ Ban"}
+      </button>
+      <button class="btnBad" data-del="\${it.key}">🗑️</button>
+    \`;
+
+    tr.appendChild(tdKey);
+    tr.appendChild(tdInfo);
+    tr.appendChild(tdTime);
+    tr.appendChild(tdAct);
+    rows.appendChild(tr);
+  }
+
+  rows.querySelectorAll("[data-copy]").forEach(btn=>{
+    btn.onclick = async ()=>{
+      const k = btn.getAttribute("data-copy");
+      try{
+        await navigator.clipboard.writeText(k);
+        toast("✅ Clé copiée");
+      }catch{
+        const ta=document.createElement("textarea");
+        ta.value=k; document.body.appendChild(ta);
+        ta.select(); document.execCommand("copy");
+        ta.remove();
+        toast("✅ Clé copiée");
+      }
+    };
+  });
+
+  rows.querySelectorAll("[data-del]").forEach(btn=>{
+    btn.onclick = async ()=>{
+      const k = btn.getAttribute("data-del");
+      if(!confirm("Supprimer la clé ?\\n"+k)) return;
+      try{
+        await post("/api/admin/delete", { key:k });
+        toast("🗑️ supprimée");
+        await refresh();
+      }catch(e){ toast("❌ "+e.message); }
+    };
+  });
+
+  rows.querySelectorAll("[data-ban]").forEach(btn=>{
+    btn.onclick = async ()=>{
+      const k = btn.getAttribute("data-ban");
+      const banned = btn.getAttribute("data-banned")==="1";
+      try{
+        await post("/api/admin/ban", { key:k, banned: !banned });
+        toast(!banned ? "⛔ bannie" : "✅ unban");
+        await refresh();
+      }catch(e){ toast("❌ "+e.message); }
+    };
+  });
+};
+
+const refresh = async ()=>{
+  try{
+    const j = await post("/api/admin/list", { limit: 500 });
+    cache.items = j.items || [];
+    cache.now = j.now || Date.now();
+
+    $("st_total").textContent = j.stats?.total ?? cache.items.length;
+    $("st_active").textContent = j.stats?.active ?? 0;
+    $("st_expired").textContent = j.stats?.expired ?? 0;
+    $("st_banned").textContent = j.stats?.banned ?? 0;
+
+    render();
+    toast("🔄 OK");
+  }catch(e){
+    toast("❌ "+e.message);
+  }
+};
+
+$("refresh").onclick = refresh;
+$("search").oninput = render;
+
+$("gen").onclick = async ()=>{
+  try{
+    const days = Number($("days").value || 30);
+    const count = Number($("count").value || 1);
+    const note = $("note").value || "";
+    const j = await post("/api/admin/create", { days, note, count });
+
+    const first = j.created?.[0]?.key;
+    if(first){
+      try{ await navigator.clipboard.writeText(first); }catch{}
+      toast("✅ Généré (1ère clé copiée)");
+    }else{
+      toast("✅ Généré");
+    }
+
+    $("note").value = "";
+    await refresh();
+  }catch(e){ toast("❌ "+e.message); }
+};
+
+$("export").onclick = async ()=>{
+  try{
+    const j = await post("/api/admin/export", {});
+    const blob = new Blob([JSON.stringify(j.export, null, 2)], {type:"application/json"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "sp-spoof-keys-export.json";
+    a.click();
+    toast("📦 Export téléchargé");
+  }catch(e){ toast("❌ "+e.message); }
+};
+
+// Live countdown
+setInterval(()=>{
+  cache.now = Date.now();
+  document.querySelectorAll("[data-exp]").forEach(el=>{
+    const exp = Number(el.getAttribute("data-exp"));
+    el.textContent = msToClock(exp - cache.now);
+  });
+}, 1000);
+
+// ❄️ Snow (canvas)
+const c = $("snow"), ctx = c.getContext("2d");
+const resize=()=>{ c.width=innerWidth*devicePixelRatio; c.height=innerHeight*devicePixelRatio; };
+resize(); addEventListener("resize", resize);
+
+const flakes = Array.from({length: 110}, ()=>({
+  x: Math.random(),
+  y: Math.random(),
+  r: 0.6 + Math.random()*1.8,
+  s: 0.15 + Math.random()*0.65,
+  w: (Math.random()-0.5)*0.25,
+  a: 0.35 + Math.random()*0.45
+}));
+
+(function loop(){
+  const w=c.width, h=c.height;
+  ctx.clearRect(0,0,w,h);
+  for(const f of flakes){
+    f.y += f.s * 0.003 * h;
+    f.x += f.w * 0.002 * w;
+    if(f.y>1.02){ f.y=-0.02; f.x=Math.random(); }
+    if(f.x>1.02) f.x=-0.02;
+    if(f.x<-0.02) f.x=1.02;
+    ctx.globalAlpha = f.a;
+    ctx.beginPath();
+    ctx.arc(f.x*w, f.y*h, f.r*devicePixelRatio, 0, Math.PI*2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+  }
+  requestAnimationFrame(loop);
+})();
+
+// init
+loadSecret();
+refresh();
 </script>
 </body>
 </html>`;
-}
