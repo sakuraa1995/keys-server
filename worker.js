@@ -94,12 +94,17 @@ export default {
 
     // =========================================================
     // ✅ PUBLIC API: check key (used by Stay)
-    // GET /api/check?key=SP-XXXX-XXXX-XXXX
+    // GET /api/check?key=...&did=...
+    // Device lock: 1 clé = 1 appareil
     // =========================================================
     if (path === "/api/check" && request.method === "GET") {
       requireKV();
+
       const key = (url.searchParams.get("key") || "").trim();
+      const did = (url.searchParams.get("did") || "").trim(); // 👈 device id obligatoire
+
       if (!key) return cors(json({ ok: false, reason: "missing_key" }, 400));
+      if (!did) return cors(json({ ok: false, reason: "missing_device" }, 400));
 
       const raw = await env.KEYS_DB.get(kvKey(key));
       if (!raw) return cors(json({ ok: false, reason: "not_found" }, 404));
@@ -112,10 +117,21 @@ export default {
       }
 
       if (rec.banned) return cors(json({ ok: false, reason: "banned" }, 403));
-      if (typeof rec.exp === "number" && now >= rec.exp) return cors(json({ ok: false, reason: "expired" }, 403));
+      if (typeof rec.exp === "number" && now >= rec.exp)
+        return cors(json({ ok: false, reason: "expired" }, 403));
 
-      // touches / uses
+      // 🔒 1 appareil seulement (anti-partage)
+      rec.devices = Array.isArray(rec.devices) ? rec.devices : [];
+      if (!rec.devices.includes(did)) {
+        if (rec.devices.length >= 1) {
+          return cors(json({ ok: false, reason: "device_limit", limit: 1 }, 403));
+        }
+        rec.devices.push(did);
+      }
+
+      // uses
       rec.uses = (rec.uses || 0) + 1;
+
       await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
 
       return cors(
@@ -127,6 +143,8 @@ export default {
             remainingMs: rec.exp ? Math.max(0, rec.exp - now) : null,
             note: rec.note || "",
             uses: rec.uses || 0,
+            devices: rec.devices.length,
+            limit: 1,
           },
           200
         )
@@ -151,7 +169,6 @@ export default {
 
       const body = await safeJson(request);
       const secret = body?.secret || request.headers.get("x-admin-secret");
-
       if (!isAuthed(secret)) return cors(json({ ok: false, error: "unauthorized" }, 401));
 
       // LIST keys
@@ -165,6 +182,7 @@ export default {
           if (!raw) continue;
           try {
             const d = JSON.parse(raw);
+            const devCount = Array.isArray(d.devices) ? d.devices.length : 0;
             items.push({
               key: k.name.replace(/^KEY:/, ""),
               banned: !!d.banned,
@@ -172,6 +190,7 @@ export default {
               created: typeof d.created === "number" ? d.created : null,
               note: d.note || "",
               uses: d.uses || 0,
+              devices: devCount,
             });
             if (items.length >= limit) break;
           } catch {}
@@ -201,7 +220,14 @@ export default {
         for (let i = 0; i < count; i++) {
           const key = randomKey();
           const exp = now + days * 86400000;
-          const rec = { banned: false, exp, created: now, note, uses: 0 };
+          const rec = {
+            banned: false,
+            exp,
+            created: now,
+            note,
+            uses: 0,
+            devices: [], // 👈 important
+          };
           await env.KEYS_DB.put(kvKey(key), JSON.stringify(rec));
           created.push({ key, exp, note });
         }
@@ -259,7 +285,7 @@ export default {
 };
 
 // =========================
-// ADMIN PANEL (RESPONSIVE)
+// ADMIN PANEL (RESPONSIVE + SNOW)
 // =========================
 const ADMIN_HTML = `<!doctype html>
 <html lang="fr">
@@ -359,14 +385,10 @@ td:last-child{border-radius:0 14px 14px 0}
   padding:10px 14px;border-radius:14px;backdrop-filter: blur(10px);
   display:none;z-index:3;
 }
-/* ❄️ snow */
 .snow{position:fixed;inset:0;pointer-events:none;z-index:2;opacity:.9}
 
-/* =========================
-   📱 Mobile Responsive
-   ========================= */
-input, button { font-size: 16px; } /* évite zoom iOS */
-
+/* 📱 Mobile responsive */
+input, button { font-size: 16px; }
 @media (max-width: 520px) {
   .wrap { padding: 12px; }
   .card { padding: 12px; border-radius: 16px; }
@@ -378,7 +400,6 @@ input, button { font-size: 16px; } /* évite zoom iOS */
   .grow { flex: 1 1 100%; }
   .pill { width: 100%; justify-content: space-between; }
 
-  /* Table -> Cards */
   table, thead, tbody, th, tr { display: block; width: 100%; }
   thead { display: none; }
   tr { margin-bottom: 10px; }
@@ -406,7 +427,7 @@ input, button { font-size: 16px; } /* évite zoom iOS */
 <div class="wrap">
   <div class="card">
     <h1>😈 ADMIN SP-SPOOF</h1>
-    <div class="sub">Clés • Copier • Neige • Temps restant live • Bulk • Export • Ban/Delete</div>
+    <div class="sub">Clés • Copier • Neige • Temps restant • Bulk • Export • Ban/Delete • Device lock (1)</div>
 
     <div class="row">
       <input id="secret" class="grow" placeholder="ADMIN_SECRET (mot de passe)" type="password" />
@@ -525,7 +546,7 @@ const render = ()=>{
     const tdInfo = document.createElement("td");
     tdInfo.setAttribute("data-label","Info");
     tdInfo.innerHTML = \`
-      <div><b>\${status}</b> • <span class="small">uses: \${it.uses||0}</span></div>
+      <div><b>\${status}</b> • <span class="small">uses: \${it.uses||0}</span> • <span class="small">devices: \${it.devices||0}/1</span></div>
       <div class="small">\${it.note ? "📝 "+it.note : ""}</div>
     \`;
 
